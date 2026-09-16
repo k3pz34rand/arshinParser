@@ -1,0 +1,64 @@
+table/
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+eggs/
+*.egg-info/
+*.egg
+.eggs/
+
+# --- Виртуальные окружения ---
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# --- Тесты / покрытие ---
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# --- Линтеры / тайп-чекеры ---
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.flake8
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Переменные окружения и секреты ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- IDE / редакторы ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Логи и прочее ---
+*.log
+logs/
+*.sqlite3
+db.sqlite3
