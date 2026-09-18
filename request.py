@@ -1,28 +1,37 @@
 """
-Клиент для API ФГИС «Аршин»: /fundmetrology/cm/xcdb/vri/select
+Первый запрос: поиск ФГИС «Аршин»
+    GET /fundmetrology/cm/xcdb/vri/select
 
-Использование из другого скрипта:
+Плюс конвейер: для каждого найденного doc берём doc["vri_id"]
+и дёргаем карточку из arshin_details. Разбор — в arshin_parse.
 
-    from arshin import search_arshin, search_arshin_raw
+Использование:
 
-    result = search_arshin(
+    from arshin import search_arshin, fetch_details_for_docs
+    from arshin_parse import parse_vri_details
+
+    res = search_arshin(
         verification_year="2026",
         mitnumber="24319-05",
         mi_number="185357",
     )
-    for doc in result.docs:
-        print(doc["vri_id"], doc["mi.number"])
+    for doc, payload in fetch_details_for_docs(res.docs):
+        det = parse_vri_details(doc["vri_id"], payload)
+        print(det.vrf_date, det.valid_date, det.organization)
 """
 
 from __future__ import annotations
 
-import gzip
-import json
-import urllib.error
-import urllib.request
-import zlib
 from dataclasses import dataclass, field
 from typing import Any, Iterable
+
+from request_http import (
+    ArshinError,
+    DEFAULT_HEADERS,
+    build_url,
+    http_get_json,
+)
+from request_detail import get_vri_details
 
 
 API_URL = "https://fgis.gost.ru/fundmetrology/cm/xcdb/vri/select"
@@ -35,30 +44,25 @@ DEFAULT_FIELDS = (
 
 DEFAULT_SORT = "verification_date desc,org_title asc"
 
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 15; Pixel 9) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/153.0.0.0 Mobile Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Referer": "https://fgis.gost.ru/fundmetrology/cm/results",
-    "Origin": "https://fgis.gost.ru",
-    "sec-ch-ua": '"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"',
-    "sec-ch-ua-mobile": "?1",
-    "sec-ch-ua-platform": '"Android"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-}
+
+__all__ = [
+    "API_URL",
+    "DEFAULT_FIELDS",
+    "DEFAULT_SORT",
+    "SearchResult",
+    "ArshinError",
+    "search_arshin_raw",
+    "search_arshin",
+    "search_all_pages",
+    "iter_search_arshin",
+    "fetch_details_for_docs",
+    "search_with_details",
+    "get_vri_details",
+]
 
 
 # ============================================================
-# Результат
+# Результат поиска
 # ============================================================
 @dataclass
 class SearchResult:
@@ -78,61 +82,8 @@ class SearchResult:
         return iter(self.docs)
 
 
-class ArshinError(RuntimeError):
-    """Любая ошибка при обращении к API (сеть, HTTP, разбор ответа)."""
-
-
 # ============================================================
-# Внутренние помощники
-# ============================================================
-def _encode_value(value: str) -> str:
-    """Кодируем только то, что реально нужно. ':' и '*' оставляем как есть."""
-    return (
-        value.replace(" ", "+")
-             .replace('"', "%22")
-             .replace("#", "%23")
-             .replace("&", "%26")
-             .replace("?", "%3F")
-    )
-
-
-def _build_url(base: str, params: list[tuple[str, str]]) -> str:
-    parts = [f"{k}={_encode_value(str(v))}" for k, v in params if v is not None]
-    return f"{base}?{'&'.join(parts)}"
-
-
-def _decode_body(raw: bytes, encoding: str | None) -> bytes:
-    enc = (encoding or "").lower()
-    if enc == "gzip":
-        return gzip.decompress(raw)
-    if enc == "deflate":
-        try:
-            return zlib.decompress(raw)
-        except zlib.error:
-            return zlib.decompress(raw, -zlib.MAX_WBITS)
-    return raw
-
-
-def _http_get(url: str, headers: dict[str, str], timeout: float) -> bytes:
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            return _decode_body(raw, resp.headers.get("Content-Encoding"))
-    except urllib.error.HTTPError as e:
-        body = e.read()
-        try:
-            body = _decode_body(body, e.headers.get("Content-Encoding"))
-        except Exception:
-            pass
-        snippet = body.decode("utf-8", errors="replace")[:500]
-        raise ArshinError(f"HTTP {e.code} {e.reason}: {snippet}") from e
-    except urllib.error.URLError as e:
-        raise ArshinError(f"Network error: {e.reason}") from e
-
-
-# ============================================================
-# Публичные функции
+# Первый запрос: поиск
 # ============================================================
 def search_arshin_raw(
     *,
@@ -157,7 +108,6 @@ def search_arshin_raw(
     if fq:
         params.append(("fq", fq))
     if extra_fq:
-        # на практике работает только первый, добавляем на случай будущих изменений API
         for f in extra_fq:
             params.append(("fq", f))
 
@@ -169,17 +119,8 @@ def search_arshin_raw(
         ("start", str(start)),
     ])
 
-    url = _build_url(API_URL, params)
-    hdrs = dict(DEFAULT_HEADERS)
-    if headers:
-        hdrs.update(headers)
-
-    body = _http_get(url, hdrs, timeout)
-
-    try:
-        payload = json.loads(body.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError as e:
-        raise ArshinError(f"Не удалось разобрать JSON: {e}") from e
+    url = build_url(API_URL, params)
+    payload = http_get_json(url, headers=headers, timeout=timeout)
 
     resp = payload.get("response") or {}
     header = payload.get("responseHeader") or {}
@@ -233,7 +174,6 @@ def search_arshin(
         q_parts.append(f"({extra_q})")
 
     q = " AND ".join(q_parts) if q_parts else "*"
-
     fq = f"verification_year:{verification_year}" if verification_year else None
 
     return search_arshin_raw(
@@ -250,11 +190,9 @@ def search_all_pages(
     """
     Пробегает по всем страницам и возвращает единый список docs.
     Осторожно: total может быть очень большим — ставь max_records.
-
-    Все прочие kwargs пробрасываются в search_arshin().
     """
     if page_size > 100:
-        page_size = 100  # Solr обычно не отдаёт больше
+        page_size = 100
 
     collected: list[dict[str, Any]] = []
     start = 0
@@ -266,3 +204,72 @@ def search_all_pages(
         if len(res.docs) < page_size or start + page_size >= res.num_found:
             return collected
         start += page_size
+
+
+def iter_search_arshin(
+    *,
+    page_size: int = 100,
+    start: int = 0,
+    **kwargs: Any,
+) -> Iterable[dict[str, Any]]:
+    """Ленивый генератор по страницам поиска."""
+    if page_size > 100:
+        page_size = 100
+
+    while True:
+        res = search_arshin(rows=page_size, start=start, **kwargs)
+        if not res.docs:
+            return
+        yield from res.docs
+        if start + page_size >= res.num_found:
+            return
+        start += page_size
+
+
+# ============================================================
+# Конвейер: первый дёргает второй
+# ============================================================
+def fetch_details_for_docs(
+    docs: Iterable[dict[str, Any]],
+    *,
+    vri_id_key: str = "vri_id",
+    timeout: float = 30.0,
+    headers: dict[str, str] | None = None,
+) -> Iterable[tuple[dict[str, Any], dict[str, Any]]]:
+    """
+    Для каждого doc из поиска берёт doc["vri_id"] и дёргает карточку.
+    Отдаёт пары (doc, details_payload), где details_payload — СЫРОЙ ответ
+    2-го запроса (dict). Разбором занимается arshin_parse.
+
+    Пример:
+        for doc, payload in fetch_details_for_docs(res.docs):
+            det = parse_vri_details(doc["vri_id"], payload)
+    """
+    for doc in docs:
+        vid = doc.get(vri_id_key)
+        if not vid:
+            continue
+        yield doc, get_vri_details(vid, timeout=timeout, headers=headers)
+
+
+def search_with_details(
+    *,
+    rows: int = 20,
+    start: int = 0,
+    timeout: float = 30.0,
+    **search_kwargs: Any,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """
+    Один вызов: делает поиск, потом по каждому vri_id тянет карточку.
+    Возвращает список пар (search_doc, details_payload).
+
+    Пример:
+        for doc, payload in search_with_details(
+            verification_year="2026",
+            mitnumber="24319-05",
+            mi_number="185357",
+        ):
+            ...
+    """
+    res = search_arshin(rows=rows, start=start, timeout=timeout, **search_kwargs)
+    return list(fetch_details_for_docs(res.docs, timeout=timeout))

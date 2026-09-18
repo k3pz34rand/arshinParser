@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import re
 import json
@@ -6,9 +7,18 @@ from tkinter import Tk, filedialog, messagebox
 from openpyxl import load_workbook, Workbook
 from openpyxl.utils import column_index_from_string
 
-# ---- API ФГИС Аршин (файл request.py должен лежать рядом) ----
+# ---- API ФГИС Аршин ----
+# arshin.py        — поиск + конвейер (дергает arshin_details)
+# arshin_details.py — карточка поверки /iaux/vri/{vri_id}
+# arshin_http.py    — транспорт
+# arshin_parse.py   — разбор сырого ответа карточки в VriDetails
 try:
-    from request import search_arshin, ArshinError
+    from request import (
+        search_arshin,
+        fetch_details_for_docs,
+        ArshinError,
+    )
+    from request_parse import parse_vri_details, VriDetails
     ARSHIN_AVAILABLE = True
 except ImportError as _e:
     ARSHIN_AVAILABLE = False
@@ -17,13 +27,14 @@ except ImportError as _e:
 # =============================================================================
 # НАСТРОЙКИ
 # =============================================================================
-OUTPUT_SHEET = "Sheet1"     # Имя листа в выходном файле
-START_ROW = 998             # С какой строки начать запись
-DO_CHECK_ARSHIN = True      # Проверять каждую строку через API Аршина
-ARSHIN_COL = "AX"           # Колонка для сообщений о проблемах
+OUTPUT_SHEET = "Sheet1"
+START_ROW = 998
+DO_CHECK_ARSHIN = True
+ARSHIN_COL = "AX"     # Колонка для сообщений о расхождениях
+FETCH_DETAILS = True  # Тянуть карточку /iaux/vri/{vri_id} для найденной записи
 
 # =============================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ
 # =============================================================================
 def get_cell_text(ws, row, col):
     cell = ws.cell(row=row, column=col)
@@ -63,7 +74,6 @@ def choose_output_file(title="Выберите файл журнала"):
 
 
 def _to_date(v):
-    """Приводит значение ячейки к date (или None)."""
     if v is None or v == "":
         return None
     if isinstance(v, datetime):
@@ -78,6 +88,7 @@ def _to_date(v):
             continue
     return None
 
+
 def _parse_iso_date(s):
     """'2032-01-07T00:00:00Z' -> date(2032,1,7). Также понимает 'dd.mm.yyyy'."""
     if not s:
@@ -90,19 +101,29 @@ def _parse_iso_date(s):
             continue
     return None
 
+
+def _norm_str(v) -> str:
+    """Нормализуем строку для сравнения: без пробелов/кавычек/ё, регистр не важен."""
+    if v is None:
+        return ""
+    s = str(v).strip().replace('\xa0', ' ')
+    s = re.sub(r"\s+", " ", s)
+    return s.lower().replace("ё", "е")
+
+
 # =============================================================================
 # ПРОВЕРКА ЧЕРЕЗ API АРШИНА
 # =============================================================================
 def check_arshin_for_row(ws_out, row, file_name, log):
     """
-    Дёргает API для одной строки журнала.
-    Параметры запроса: year из J, mitnumber из B, mi_number из F.
+    Поиск + (опционально) карточка поверки.
 
     Возвращает:
-        ("ok", doc)      — ровно 1 запись
-        ("none", None)   — 0 записей
-        ("multi", n)     — >1 записей
-        ("error", msg)   — ошибка API / не хватает данных
+        ("ok",    VriDetails)  — ровно 1 запись, детали получены (если FETCH_DETAILS)
+        ("ok_raw", dict)       — ровно 1 запись, но FETCH_DETAILS=False
+        ("none",  None)        — 0 записей
+        ("multi", n)           — >1 записей
+        ("error", msg)         — ошибка API / не хватает данных
     """
     def val(col):
         return ws_out.cell(row=row,
@@ -117,7 +138,6 @@ def check_arshin_for_row(ws_out, row, file_name, log):
 
     d = _to_date(date_j)
 
-    # --- проверка исходных данных ---
     if not fif or not sn or not d:
         ax.value = "недостаточно данных (B/F/J) — ручная проверка"
         log.append({
@@ -128,7 +148,7 @@ def check_arshin_for_row(ws_out, row, file_name, log):
 
     year = d.year
 
-    # --- запрос ---
+    # ---------- 1-й запрос: поиск ----------
     try:
         res = search_arshin(
             verification_year=year,
@@ -155,7 +175,6 @@ def check_arshin_for_row(ws_out, row, file_name, log):
 
     n = res.num_found
 
-    # --- разбор количества ---
     if n == 0:
         ax.value = "запись не найдена — ручная проверка"
         log.append({
@@ -173,38 +192,170 @@ def check_arshin_for_row(ws_out, row, file_name, log):
         })
         return ("multi", n)
 
-        # --- ровно одна ---
-    ax.value = ""  # очищаем, если что-то было раньше
+    # ---------- ровно одна запись ----------
+    ax.value = ""
     doc = res.docs[0]
 
-    # ---- K: дата из поля "Действительна до" (valid_date) ----
-    valid_raw = doc.get("valid_date")
-    vd = _parse_iso_date(valid_raw)
-    if vd:
-        cell_k = ws_out.cell(row=row,
-                             column=column_index_from_string("K"),
-                             value=vd)
-        cell_k.number_format = 'dd.mm.yyyy'
-    else:
-        # в API пусто/непонятный формат — оставляем пусто и логируем
-        ws_out.cell(row=row,
-                    column=column_index_from_string("K"),
-                    value=None)
+    if not FETCH_DETAILS:
+        return ("ok_raw", doc)
+
+    # ---------- 2-й запрос: карточка поверки ----------
+    vid = doc.get("vri_id")
+    if not vid:
+        # странно: поиск дал запись, а vri_id нет — фиксируем, но не падаем
         log.append({
-            "file": file_name, "row": row,
-            "reason": "no_valid_date",
-            "valid_date_raw": valid_raw,
+            "file": file_name, "row": row, "reason": "no_vri_id",
+            "doc": doc,
             "params": {"B": fif, "F": sn, "year": year},
         })
+        return ("ok_raw", doc)
 
-    return ("ok", doc)
+    try:
+        # fetch_details_for_docs — генератор пар (doc, payload); нам нужен один
+        _, payload = next(iter(fetch_details_for_docs([doc], vri_id_key="vri_id")))
+    except ArshinError as e:
+        ax.value = f"ошибка API (карточка): {e}"
+        log.append({
+            "file": file_name, "row": row, "reason": "api_error_details",
+            "error": str(e), "vri_id": vid,
+            "params": {"B": fif, "F": sn, "year": year},
+        })
+        return ("error", str(e))
+    except Exception as e:
+        ax.value = f"ошибка API (карточка): {e}"
+        log.append({
+            "file": file_name, "row": row, "reason": "unexpected_error_details",
+            "error": str(e), "vri_id": vid,
+            "params": {"B": fif, "F": sn, "year": year},
+        })
+        return ("error", str(e))
 
+    det = parse_vri_details(vid, payload)
+    return ("ok", det)
+
+
+# =============================================================================
+# СВЕРКА И ЗАПОЛНЕНИЕ ПО ДАННЫМ КАРТОЧКИ
+# =============================================================================
+def apply_details_and_compare(ws_out, row, det: VriDetails, file_name, log):
+    """
+    Заполняет пустые E/H/I/J/K/L/O/Y и собирает расхождения с уже вписанными
+    значениями. Список расхождений пишет в AX.
+
+    Возвращает список строк-предупреждений (для лога/принта).
+    """
+    ax = ws_out.cell(row=row, column=column_index_from_string(ARSHIN_COL))
+    ax.number_format = '@'
+
+    def cell(col):
+        return ws_out.cell(row=row, column=column_index_from_string(col))
+
+    problems: list[str] = []
+
+    # ---------- J: дата поверки ----------
+    vrf_dt = _parse_iso_date(det.vrf_date)  # из карточки приходит dd.mm.yyyy
+    j = cell("J")
+    if vrf_dt:
+        cur = _to_date(j.value)
+        if cur is None:
+            j.value = vrf_dt
+            j.number_format = 'dd.mm.yyyy'
+        elif cur != vrf_dt:
+            problems.append(f"J: журнал {cur:%d.%m.%Y} ≠ API {vrf_dt:%d.%m.%Y}")
+
+    # ---------- K: действительна до ----------
+    val_dt = _parse_iso_date(det.valid_date)
+    k = cell("K")
+    if val_dt:
+        cur = _to_date(k.value)
+        if cur is None:
+            k.value = val_dt
+            k.number_format = 'dd.mm.yyyy'
+        elif cur != val_dt:
+            problems.append(f"K: журнал {cur:%d.%m.%Y} ≠ API {val_dt:%d.%m.%Y}")
+    else:
+        log.append({
+            "file": file_name, "row": row, "reason": "no_valid_date",
+            "vri_id": det.vri_id, "valid_date_raw": det.valid_date,
+        })
+
+    # ---------- E: модификация ----------
+    if det.modification:
+        e = cell("E")
+        if not _norm_str(e.value):
+            e.value = det.modification
+        elif _norm_str(e.value) != _norm_str(det.modification):
+            problems.append(f"E: журнал «{e.value}» ≠ API «{det.modification}»")
+
+    # ---------- H: год изготовления ----------
+    if det.manufacture_year:
+        h = cell("H")
+        try:
+            cur = int(h.value) if h.value not in (None, "") else None
+        except Exception:
+            cur = None
+        if cur is None:
+            h.value = det.manufacture_year
+        elif cur != int(det.manufacture_year):
+            problems.append(f"H: журнал {cur} ≠ API {det.manufacture_year}")
+
+    # ---------- B / F: № ФИФ ОЕИ и заводской ----------
+    if det.mitype_number:
+        b = cell("B")
+        if _norm_str(b.value) and _norm_str(b.value) != _norm_str(det.mitype_number):
+            problems.append(f"B: журнал «{b.value}» ≠ API «{det.mitype_number}»")
+
+    if det.manufacture_num:
+        f = cell("F")
+        if _norm_str(f.value) and _norm_str(f.value) != _norm_str(det.manufacture_num):
+            problems.append(f"F: журнал «{f.value}» ≠ API «{det.manufacture_num}»")
+
+    # ---------- I: владелец СИ (miOwner) ----------
+    if det.mi_owner:
+        i = cell("I")
+        cur = _norm_str(i.value)
+        if not cur:
+            i.value = det.mi_owner
+        elif cur != _norm_str(det.mi_owner):
+            problems.append(f"I: журнал «{i.value}» ≠ API «{det.mi_owner}»")
+
+    # ---------- L: документ на методику поверки (docTitle) ----------
+    if det.doc_title:
+        l = cell("L")
+        cur = _norm_str(l.value)
+        if not cur:
+            l.value = det.doc_title
+        elif cur != _norm_str(det.doc_title):
+            problems.append(f"L: журнал «{l.value}» ≠ API «{det.doc_title}»")
+
+    # ---------- Y: рег. номер эталона (только из API) ----------
+    if det.mi_eta and det.mi_eta[0].reg_number:
+        y = cell("Y")
+        y.value = det.mi_eta[0].reg_number
+
+    # ---------- O: результат поверки ----------
+    # O заполняется из A46 протокола, отдельно от API.
+
+    # ---------- AX: что писать ----------
+    if problems:
+        ax.value = "; ".join(problems)
+        log.append({
+            "file": file_name, "row": row, "reason": "mismatch",
+            "vri_id": det.vri_id,
+            "problems": problems,
+            "cert_num": det.cert_num,
+            "organization": det.organization,
+        })
+    else:
+        if not ax.value:
+            ax.value = ""
+
+    return problems
 
 # =============================================================================
 # ОСНОВНАЯ ПРОЦЕДУРА
 # =============================================================================
 def main():
-    # --- Выбор папки с протоколами ---
     folder_path = choose_folder()
     if not folder_path:
         print("Папка не выбрана. Выход.")
@@ -213,7 +364,6 @@ def main():
         print(f"Папка не существует: {folder_path}")
         return
 
-    # --- Выбор файла журнала ---
     output_file = choose_output_file()
     if not output_file:
         print("Файл журнала не выбран. Выход.")
@@ -226,13 +376,12 @@ def main():
     print(f"Журнал: {output_file}")
 
     if DO_CHECK_ARSHIN and not ARSHIN_AVAILABLE:
-        print(f"⚠ Не удалось импортировать arshin.py: {_ARSHIN_IMPORT_ERROR}")
+        print(f"⚠ Не удалось импортировать arshin/arshin_parse: {_ARSHIN_IMPORT_ERROR}")
         print("  Проверка через API будет пропущена.")
         do_check = False
     else:
         do_check = DO_CHECK_ARSHIN
 
-    # --- Загружаем журнал ---
     wb_out = load_workbook(output_file)
     if OUTPUT_SHEET in wb_out.sheetnames:
         ws_out = wb_out[OUTPUT_SHEET]
@@ -284,7 +433,7 @@ def main():
                             column=column_index_from_string("E"),
                             value=temp.strip())
 
-            # ---- СТРОКА 10: № ФИФ ОЕИ -> B, Заводской № -> F, Год -> H ----
+            # ---- СТРОКА 10: ФИФ ОЕИ -> B, Заводской -> F, Год -> H ----
             txt = get_cell_text(ws_src, 10, 1)
 
             pos = txt.find("№ ФИФ ОЕИ")
@@ -321,7 +470,7 @@ def main():
                             column=column_index_from_string("H"),
                             value=year_val)
 
-            # ---- СТРОКА 21: Первый заводской номер -> Y ----
+            # ---- СТРОКА 21: Первый заводской -> Y ----
             txt = get_cell_text(ws_src, 21, 1)
             pos = txt.find("зав. №")
             if pos != -1:
@@ -332,7 +481,7 @@ def main():
                             column=column_index_from_string("Y"),
                             value=temp.strip())
 
-            # ---- СТРОКИ 27, 28, 29: (C + D) / 2 -> AE, AF, AG ----
+            # ---- СТРОКИ 27/28/29 -> AE/AF/AG ----
             c27 = val_func(ws_src.cell(row=27, column=3).value)
             d27 = val_func(ws_src.cell(row=27, column=4).value)
             cell_ae = ws_out.cell(row=current_row,
@@ -354,7 +503,7 @@ def main():
                                   value=((c28 + d28) / 2) / 100)
             cell_ag.number_format = '0.0%'
 
-            # ---- A46: Результаты поверки -> O ----
+            # ---- A46: Результат поверки -> O ----
             txt = get_cell_text(ws_src, 46, 1)
             ws_out.cell(row=current_row,
                         column=column_index_from_string("O"),
@@ -385,15 +534,25 @@ def main():
                 status, payload = check_arshin_for_row(
                     ws_out, current_row, file_name, arshin_log
                 )
+
                 if status == "ok":
-                    print(f"    ✓ Аршин: одна запись найдена")
+                    det: VriDetails = payload
+                    print(f"    ✓ Аршин: 1 запись, vri_id={det.vri_id}")
+                    problems = apply_details_and_compare(
+                        ws_out, current_row, det, file_name, arshin_log
+                    )
+                    if problems:
+                        print("      ⚠ расхождения: " + "; ".join(problems))
+                    else:
+                        print("      ✓ поля совпадают")
+                elif status == "ok_raw":
+                    print("    ✓ Аршин: 1 запись (детали не запрашивались)")
                 elif status == "none":
-                    print(f"    ✗ Аршин: запись не найдена")
+                    print("    ✗ Аршин: запись не найдена")
                 elif status == "multi":
                     print(f"    ⚠ Аршин: несколько записей ({payload})")
                 elif status == "error":
                     print(f"    ! Аршин: ошибка ({payload})")
-                # здесь позже можно добавить сверку полей AW/J/K/O/E
             except Exception as e:
                 print(f"    ! Сверка упала для {file_name}: {e}")
 
